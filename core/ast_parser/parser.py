@@ -115,26 +115,52 @@ class ASTParser:
     def detect_potential_bugs(self) -> List[Dict]:
         """Detect bugs with cross-function analysis."""
         bugs = []
+        assigned_vars = {}
+        used_vars = set()
 
         for node in ast.walk(self.ast_tree):
             # Detect division by zero
             if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-                if isinstance(node.right, ast.Constant) and node.right.value == 0:
-                    bugs.append(
-                        self._create_bug(
-                            "ZeroDivision", node.lineno, "Direct division by zero"
-                        )
-                    )
-                elif isinstance(node.right, ast.Name):
-                    var_name = node.right.id
+                right = node.right
+                if isinstance(right, ast.Constant) and right.value == 0:
+                    bugs.append(self._create_bug('ZeroDivision', node.lineno, 'Direct division by zero'))
+                elif isinstance(right, ast.Name):
+                    var_name = right.id
                     if self._is_zero_in_scope(var_name, node):
-                        bugs.append(
-                            self._create_bug(
-                                "ZeroDivision",
-                                node.lineno,
-                                f"Division by {var_name} which may be zero",
-                            )
-                        )
+                        bugs.append(self._create_bug('ZeroDivision', node.lineno,
+                                                   f'Division by {var_name} which may be zero'))
+
+            # Track assignments
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        var_name = target.id
+                        if var_name not in assigned_vars:
+                            assigned_vars[var_name] = node.lineno
+            # Track usages
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                used_vars.add(node.id)
+
+            # Detect None comparisons
+            if isinstance(node, ast.Compare):
+                for op in node.ops:
+                    if isinstance(op, (ast.Is, ast.IsNot, ast.Eq, ast.NotEq)):
+                        for comparator in node.comparators:
+                            if isinstance(comparator, ast.Constant) and comparator.value is None:
+                                bugs.append(self._create_bug('NoneComparison', node.lineno,
+                                    'Direct None comparison, consider using "is" or "is not"'))
+
+            # Detect empty except blocks
+            if isinstance(node, ast.ExceptHandler):
+                if node.type is None:
+                    bugs.append(self._create_bug('EmptyExcept', node.lineno,
+                                'Empty except block - silently ignoring exceptions'))
+
+        # Check for unused variables
+        for var, line in assigned_vars.items():
+            if var not in used_vars:
+                bugs.append(self._create_bug('UnusedVariable', line, f'Variable {var} is assigned but not used'))
+
         return bugs
 
     def _is_zero_in_scope(self, var_name: str, node: ast.AST) -> bool:
