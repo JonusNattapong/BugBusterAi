@@ -1,0 +1,7 @@
+numpy>=1.21.0
+torch>=1.10.0
+astor>=0.8.1
+networkx>=2.6.3
+tqdm>=4.62.3
+python-igraph>=0.9.11
+pytest>=7.0.0
