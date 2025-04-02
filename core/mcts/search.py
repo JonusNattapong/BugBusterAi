@@ -1,9 +1,13 @@
 import numpy as np
 import networkx as nx
+import torch
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 from ..knowledge_graph.builder import KnowledgeGraphBuilder
 from ..neural_nets.models import PolicyNetwork, ValueNetwork
+
+if TYPE_CHECKING:
+    from ..neural_nets.models import BugBusterModel
 
 class MCTSBugSearch:
     """Enhanced MCTS with neural guidance, parallel simulations and learning capabilities."""
@@ -11,7 +15,7 @@ class MCTSBugSearch:
     def __init__(self, knowledge_graph: nx.DiGraph,
                  policy_net: PolicyNetwork,
                  value_net: ValueNetwork,
-                 bug_buster_model: 'BugBusterModel' = None,
+                 bug_buster_model: Optional['BugBusterModel'] = None,
                  max_workers: int = 4):
         self.graph = knowledge_graph
         self.policy_net = policy_net
