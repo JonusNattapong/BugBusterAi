@@ -8,33 +8,50 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
-class ASTParser:
-    """Enhanced AST parser with cross-function analysis."""
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Union, Tuple, Set
 
-    def __init__(self):
+class ASTParser:
+    """Enhanced AST parser with parallel processing and advanced analysis."""
+
+    def __init__(self, max_workers: int = 4):
         self.ast_tree = None
         self.source_code = ""
-        self.var_assignments = {}  # Track variable assignments
+        self.var_assignments = {}  # Track variable assignments with types
         self.function_calls = {}  # Track function call relationships
-        self.function_params = {}  # Track function parameters
+        self.function_params = {}  # Track function parameters with types
+        self.control_flows = {}  # Track control flow paths
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
 
     def parse(self, source_code: str) -> ast.AST:
-        """Parse source code and build analysis structures."""
+        """Parse source code with parallel processing and advanced analysis."""
         self.source_code = source_code
         self.ast_tree = ast.parse(source_code)
 
-        # Build analysis structures
-        self._track_assignments()
-        self._build_call_graph()
+        # Parallel analysis
+        futures = [
+            self.executor.submit(self._track_assignments),
+            self.executor.submit(self._build_call_graph),
+            self.executor.submit(self._analyze_control_flow)
+        ]
+        _ = [f.result() for f in futures]
+
         return self.ast_tree
 
     def _track_assignments(self):
-        """Track variable assignments with scope awareness."""
+        """Track variable assignments with type inference and scope awareness."""
         current_scope = []
 
         def visit_node(node):
             if isinstance(node, ast.FunctionDef):
                 current_scope.append(node.name)
+                # Infer parameter types from annotations
+                for arg in node.args.args:
+                    if arg.annotation:
+                        self.function_params[node.name][arg.arg] = {
+                            **self.function_params[node.name].get(arg.arg, {}),
+                            "type": self._get_annotation_type(arg.annotation)
+                        }
                 for child in ast.iter_child_nodes(node):
                     visit_node(child)
                 current_scope.pop()
@@ -43,11 +60,23 @@ class ASTParser:
                     if isinstance(target, ast.Name):
                         var_name = target.id
                         scope = current_scope[-1] if current_scope else "global"
+                        inferred_type = self._infer_type(node.value)
                         self.var_assignments[var_name] = {
                             "lineno": node.lineno,
                             "value": self._get_node_value(node.value),
                             "scope": scope,
+                            "type": inferred_type
                         }
+            elif isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name):
+                    var_name = node.target.id
+                    scope = current_scope[-1] if current_scope else "global"
+                    self.var_assignments[var_name] = {
+                        "lineno": node.lineno,
+                        "value": self._get_node_value(node.value) if node.value else None,
+                        "scope": scope,
+                        "type": self._get_annotation_type(node.annotation)
+                    }
             else:
                 for child in ast.iter_child_nodes(node):
                     visit_node(child)
@@ -221,9 +250,53 @@ class ASTParser:
 
         return False
 
+    def _analyze_control_flow(self):
+        """Analyze control flow paths between functions."""
+        for node in ast.walk(self.ast_tree):
+            if isinstance(node, ast.If):
+                test_str = astor.to_source(node.test).strip()
+                for body_node in node.body:
+                    if isinstance(body_node, ast.Expr) and isinstance(body_node.value, ast.Call):
+                        if isinstance(body_node.value.func, ast.Name):
+                            func_name = body_node.value.func.id
+                            self.control_flows.setdefault(func_name, []).append({
+                                "condition": test_str,
+                                "lineno": node.lineno
+                            })
+
+    def _infer_type(self, node: ast.AST) -> Union[str, None]:
+        """Infer variable type from AST node."""
+        if isinstance(node, ast.Constant):
+            return type(node.value).__name__
+        elif isinstance(node, ast.Name):
+            if node.id in self.var_assignments:
+                return self.var_assignments[node.id].get("type")
+        elif isinstance(node, ast.Call):
+            return "function"
+        elif isinstance(node, ast.List):
+            return "list"
+        elif isinstance(node, ast.Dict):
+            return "dict"
+        return None
+
+    def _get_annotation_type(self, node: ast.AST) -> str:
+        """Extract type from annotation node."""
+        if isinstance(node, ast.Name):
+            return node.id
+        elif isinstance(node, ast.Subscript):
+            return f"{node.value.id}[{self._get_annotation_type(node.slice)}]"
+        elif isinstance(node, ast.Attribute):
+            return f"{node.value.id}.{node.attr}"
+        return "Any"
+
     def _create_bug(self, bug_type: str, lineno: int, message: str) -> Dict:
-        """Create a bug report dictionary."""
-        return {"type": bug_type, "lineno": lineno, "message": message}
+        """Create a bug report dictionary with enhanced info."""
+        return {
+            "type": bug_type,
+            "lineno": lineno,
+            "message": message,
+            "context": self._get_code_context(lineno)
+        }
 
     def get_function_definitions(self) -> List[Dict]:
         """Get all function definitions in the code."""

@@ -1,79 +1,105 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import BertModel, BertConfig
+
+class CodeTransformer(nn.Module):
+    """Shared transformer encoder for code representation."""
+    
+    def __init__(self, config=None):
+        super().__init__()
+        if config is None:
+            config = BertConfig(
+                vocab_size=30000,
+                hidden_size=768,
+                num_hidden_layers=6,
+                num_attention_heads=12,
+                intermediate_size=3072,
+                max_position_embeddings=512
+            )
+        self.encoder = BertModel(config)
+        
+    def forward(self, input_ids, attention_mask=None):
+        outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        return outputs.last_hidden_state
 
 class PolicyNetwork(nn.Module):
-    """Predicts likely bug locations in code."""
+    """Transformer-based bug location predictor."""
     
-    def __init__(self, input_dim=256, hidden_dim=512):
+    def __init__(self, transformer):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        self.locator = nn.Linear(hidden_dim, 1)  # Predicts bug probability
+        self.transformer = transformer
+        self.locator = nn.Linear(768, 1)  # Predicts bug probability
+        self.attention = nn.MultiheadAttention(768, 8)
         
-    def forward(self, x):
-        features = self.encoder(x)
-        return torch.sigmoid(self.locator(features))
+    def forward(self, input_ids, attention_mask=None):
+        features = self.transformer(input_ids, attention_mask)
+        attn_output, _ = self.attention(
+            features, features, features
+        )
+        return torch.sigmoid(self.locator(attn_output.mean(dim=1)))
 
 class ValueNetwork(nn.Module):
-    """Assesses severity of detected bugs."""
+    """Transformer-based bug severity assessor."""
     
-    def __init__(self, input_dim=256, hidden_dim=512):
+    def __init__(self, transformer):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        self.assessor = nn.Linear(hidden_dim, 3)  # [minor, moderate, critical]
+        self.transformer = transformer
+        self.assessor = nn.Linear(768, 3)  # [minor, moderate, critical]
         
-    def forward(self, x):
-        features = self.encoder(x)
-        return F.softmax(self.assessor(features), dim=-1)
+    def forward(self, input_ids, attention_mask=None):
+        features = self.transformer(input_ids, attention_mask)
+        return F.softmax(self.assessor(features.mean(dim=1)), dim=-1)
 
 class FixGenerator(nn.Module):
-    """Generates potential fixes for detected bugs."""
+    """Transformer-based fix generator."""
     
-    def __init__(self, vocab_size=10000, embed_dim=256, hidden_dim=512):
+    def __init__(self, transformer, vocab_size=30000):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.encoder = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
-        self.decoder = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
-        self.generator = nn.Linear(hidden_dim, vocab_size)
+        self.transformer = transformer
+        self.generator = nn.Linear(768, vocab_size)
         
-    def forward(self, x, max_length=20):
-        embedded = self.embedding(x)
-        _, (hidden, cell) = self.encoder(embedded)
+    def forward(self, input_ids, attention_mask=None, max_length=20):
+        encoder_outputs = self.transformer(input_ids, attention_mask)
         
         # Start with SOS token
-        inputs = torch.zeros(embedded.size(0), 1).long().to(x.device)
+        inputs = torch.zeros(input_ids.size(0), 1).long().to(input_ids.device)
         outputs = []
         
         for _ in range(max_length):
-            decoder_embedded = self.embedding(inputs)
-            out, (hidden, cell) = self.decoder(decoder_embedded, (hidden, cell))
-            logits = self.generator(out.squeeze(1))
+            decoder_outputs = self.transformer(inputs)
+            logits = self.generator(decoder_outputs.mean(dim=1))
             outputs.append(logits)
             inputs = logits.argmax(-1).unsqueeze(1)
             
         return torch.stack(outputs, dim=1)
 
 class BugBusterModel(nn.Module):
-    """Combined model integrating all neural components."""
+    """End-to-end transformer-based bug detection and fixing."""
     
-    def __init__(self):
+    def __init__(self, pretrained_path=None):
         super().__init__()
-        self.policy_net = PolicyNetwork()
-        self.value_net = ValueNetwork()
-        self.fix_gen = FixGenerator()
+        self.transformer = CodeTransformer()
         
-    def forward(self, code_representation):
-        bug_probs = self.policy_net(code_representation)
-        severities = self.value_net(code_representation)
-        fixes = self.fix_gen(code_representation)
+        if pretrained_path:
+            self.transformer.load_state_dict(torch.load(pretrained_path))
+        
+        self.policy_net = PolicyNetwork(self.transformer)
+        self.value_net = ValueNetwork(self.transformer)
+        self.fix_gen = FixGenerator(self.transformer)
+        
+    def forward(self, input_ids, attention_mask=None):
+        shared_features = self.transformer(input_ids, attention_mask)
+        
+        bug_probs = self.policy_net(input_ids, attention_mask)
+        severities = self.value_net(input_ids, attention_mask)
+        fixes = self.fix_gen(input_ids, attention_mask)
+        
         return bug_probs, severities, fixes
+    
+    def save_pretrained(self, path):
+        """Save pretrained transformer weights."""
+        torch.save(self.transformer.state_dict(), path)

@@ -1,39 +1,54 @@
 import numpy as np
 import networkx as nx
-from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional, Tuple
 from ..knowledge_graph.builder import KnowledgeGraphBuilder
+from ..neural_nets.models import PolicyNetwork, ValueNetwork
 
 class MCTSBugSearch:
-    """Monte Carlo Tree Search for bug detection."""
+    """Enhanced MCTS with neural guidance and parallel simulations."""
     
-    def __init__(self, knowledge_graph: nx.DiGraph):
+    def __init__(self, knowledge_graph: nx.DiGraph,
+                 policy_net: PolicyNetwork,
+                 value_net: ValueNetwork,
+                 max_workers: int = 4):
         self.graph = knowledge_graph
-        self.tree = {}  # Search tree
+        self.policy_net = policy_net
+        self.value_net = value_net
+        self.tree = {}  # Search tree with state caching
         self.simulation_count = 0
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.state_cache = {}
         
-    def search(self, max_iterations: int = 1000) -> List[Dict]:
-        """Perform MCTS to find potential bugs."""
+    def search(self, max_iterations: int = 1000,
+               parallel_sims: int = 4) -> List[Dict]:
+        """Perform MCTS with parallel simulations and neural guidance."""
         root_state = self._get_initial_state()
         self.tree[root_state] = {
             'visits': 0,
             'value': 0,
-            'children': []
+            'children': [],
+            'state_vector': self._state_to_vector(root_state)
         }
         
-        for _ in range(max_iterations):
-            # Selection
-            state = self._select(root_state)
+        for _ in range(max_iterations // parallel_sims):
+            # Parallel selection and expansion
+            states = []
+            for _ in range(parallel_sims):
+                state = self._select(root_state)
+                if not self._is_terminal(state):
+                    state = self._expand(state)
+                states.append(state)
             
-            # Expansion
-            if not self._is_terminal(state):
-                state = self._expand(state)
-                
-            # Simulation
-            reward = self._simulate(state)
+            # Parallel simulation
+            futures = [self.executor.submit(self._simulate, state)
+                      for state in states]
+            rewards = [f.result() for f in futures]
             
             # Backpropagation
-            self._backpropagate(state, reward)
-            
+            for state, reward in zip(states, rewards):
+                self._backpropagate(state, reward)
+        
         return self._get_best_bugs(root_state)
         
     def _select(self, state: str) -> str:
@@ -68,11 +83,23 @@ class MCTSBugSearch:
         return new_state
         
     def _simulate(self, state: str) -> float:
-        """Simulate execution path and evaluate for bugs."""
+        """Simulate with neural network evaluation."""
         self.simulation_count += 1
-        # Placeholder - would integrate with neural networks
-        potential_bugs = self._evaluate_state(state)
-        return -len(potential_bugs)  # Negative reward for bugs
+        
+        if state in self.state_cache:
+            state_vec = self.state_cache[state]
+        else:
+            state_vec = self._state_to_vector(state)
+            self.state_cache[state] = state_vec
+        
+        # Get neural network predictions
+        with torch.no_grad():
+            bug_prob = self.policy_net(state_vec)
+            severity = self.value_net(state_vec)
+        
+        # Reward based on bug probability and severity
+        reward = -(bug_prob * severity[2])  # Negative reward weighted by critical severity
+        return float(reward)
         
     def _backpropagate(self, state: str, reward: float):
         """Backpropagate simulation results."""
@@ -81,10 +108,30 @@ class MCTSBugSearch:
             self.tree[state]['value'] += reward
             state = self._get_parent_state(state)
             
-    def _evaluate_state(self, state: str) -> List[Dict]:
-        """Evaluate code state for potential bugs."""
-        # Placeholder - would use neural networks for evaluation
-        return []
+    def _state_to_vector(self, state: str) -> torch.Tensor:
+        """Convert state to feature vector for neural networks."""
+        # Extract features from knowledge graph
+        features = []
+        
+        # Node centrality features
+        if state in self.graph:
+            features.extend([
+                self.graph.degree(state),
+                nx.clustering(self.graph, state),
+                len(list(self.graph.successors(state))),
+                len(list(self.graph.predecessors(state)))
+            ])
+            
+            # Node type specific features
+            node_data = self.graph.nodes[state]
+            if node_data.get('type') == 'function':
+                features.append(len(node_data.get('args', [])))
+            elif node_data.get('type') == 'variable':
+                features.append(node_data.get('usage_count', 0))
+        else:
+            features.extend([0]*4)
+        
+        return torch.FloatTensor(features)
         
     def _get_initial_state(self) -> str:
         """Get initial state from knowledge graph."""
@@ -106,6 +153,35 @@ class MCTSBugSearch:
         return None
         
     def _get_best_bugs(self, root_state: str) -> List[Dict]:
-        """Extract best bug candidates from search."""
-        # Placeholder - would analyze search results
-        return []
+        """Extract bugs with highest probability and severity."""
+        bugs = []
+        
+        # Get top states by visit count
+        states = sorted(
+            self.tree.keys(),
+            key=lambda s: self.tree[s]['visits'],
+            reverse=True
+        )[:10]
+        
+        for state in states:
+            if state in self.graph:
+                state_data = self.graph.nodes[state]
+                if state_data.get('type') in ['function', 'variable']:
+                    with torch.no_grad():
+                        state_vec = self._state_to_vector(state)
+                        bug_prob = self.policy_net(state_vec)
+                        severity = self.value_net(state_vec)
+                    
+                    bugs.append({
+                        'location': state,
+                        'type': state_data.get('type'),
+                        'probability': float(bug_prob),
+                        'severity': {
+                            'minor': float(severity[0]),
+                            'moderate': float(severity[1]),
+                            'critical': float(severity[2])
+                        },
+                        'visits': self.tree[state]['visits']
+                    })
+        
+        return sorted(bugs, key=lambda x: x['probability'] * x['severity']['critical'], reverse=True)
