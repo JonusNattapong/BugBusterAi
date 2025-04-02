@@ -78,7 +78,7 @@ class FixGenerator(nn.Module):
         return torch.stack(outputs, dim=1)
 
 class BugBusterModel(nn.Module):
-    """End-to-end transformer-based bug detection and fixing."""
+    """End-to-end transformer-based bug detection and fixing with learning capabilities."""
     
     def __init__(self, pretrained_path=None):
         super().__init__()
@@ -91,6 +91,12 @@ class BugBusterModel(nn.Module):
         self.value_net = ValueNetwork(self.transformer)
         self.fix_gen = FixGenerator(self.transformer)
         
+        # Learning components
+        from .learning import ErrorLearning, SelfLearning
+        self.error_learner = ErrorLearning(self.policy_net, self.value_net)
+        self.self_learner = SelfLearning(self.policy_net, self.value_net, self.fix_gen)
+        self.experience_memory = []
+        
     def forward(self, input_ids, attention_mask=None):
         shared_features = self.transformer(input_ids, attention_mask)
         
@@ -99,6 +105,24 @@ class BugBusterModel(nn.Module):
         fixes = self.fix_gen(input_ids, attention_mask)
         
         return bug_probs, severities, fixes
+    
+    def record_error(self, input_ids, predicted, actual):
+        """Record prediction errors for error-based learning."""
+        state = self.transformer(input_ids)
+        self.error_learner.record_error(state, predicted, actual)
+        
+    def record_experience(self, input_ids, actions, rewards):
+        """Record experiences for self-learning."""
+        states = self.transformer(input_ids)
+        self.self_learner.record_episode(states, actions, rewards)
+        
+    def learn_from_errors(self, batch_size=32):
+        """Update models based on recorded errors."""
+        return self.error_learner.analyze_errors(batch_size)
+        
+    def self_improve(self, batch_size=32):
+        """Improve models using self-generated data."""
+        return self.self_learner.self_improve(batch_size)
     
     def save_pretrained(self, path):
         """Save pretrained transformer weights."""

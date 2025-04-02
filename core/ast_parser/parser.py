@@ -146,6 +146,8 @@ class ASTParser:
         bugs = []
         assigned_vars = {}
         used_vars = set()
+        opened_resources = set()
+        default_values = {}
 
         for node in ast.walk(self.ast_tree):
             # Detect division by zero
@@ -166,6 +168,10 @@ class ASTParser:
                         var_name = target.id
                         if var_name not in assigned_vars:
                             assigned_vars[var_name] = node.lineno
+                        # Track default values
+                        if isinstance(node.value, ast.Constant):
+                            default_values[var_name] = node.value.value
+
             # Track usages
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
                 used_vars.add(node.id)
@@ -185,10 +191,55 @@ class ASTParser:
                     bugs.append(self._create_bug('EmptyExcept', node.lineno,
                                 'Empty except block - silently ignoring exceptions'))
 
+            # Detect resource leaks
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr in ('open', 'connect', 'start'):
+                    if isinstance(node.func.value, ast.Name):
+                        opened_resources.add(node.func.value.id)
+                elif node.func.attr in ('close', 'disconnect', 'stop'):
+                    if isinstance(node.func.value, ast.Name):
+                        if node.func.value.id in opened_resources:
+                            opened_resources.remove(node.func.value.id)
+
+            # Detect unsafe default values
+            if isinstance(node, ast.FunctionDef):
+                for arg in node.args.args:
+                    if arg in node.args.defaults:
+                        default = node.args.defaults[node.args.args.index(arg)]
+                        if isinstance(default, ast.Constant) and default.value == []:
+                            bugs.append(self._create_bug('UnsafeDefault', node.lineno,
+                                f'Mutable default value for parameter {arg.arg}'))
+
+            # Detect potential infinite recursion
+            if isinstance(node, ast.FunctionDef):
+                for call in ast.walk(node):
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                        if call.func.id == node.name:
+                            bugs.append(self._create_bug('PossibleRecursion', node.lineno,
+                                f'Function {node.name} may cause infinite recursion'))
+
+            # Detect None attribute access
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                var_name = node.value.id
+                if var_name in self.var_assignments and self.var_assignments[var_name].get('type') == 'NoneType':
+                    bugs.append(self._create_bug('NoneAttribute', node.lineno,
+                        f'Accessing attribute {node.attr} on potentially None value {var_name}'))
+
         # Check for unused variables
         for var, line in assigned_vars.items():
             if var not in used_vars:
                 bugs.append(self._create_bug('UnusedVariable', line, f'Variable {var} is assigned but not used'))
+
+        # Check for unclosed resources
+        for resource in opened_resources:
+            bugs.append(self._create_bug('ResourceLeak', assigned_vars.get(resource, 0),
+                f'Resource {resource} may not be properly closed'))
+
+        # Check for unsafe default values
+        for var, value in default_values.items():
+            if value == [] or value == {}:
+                bugs.append(self._create_bug('UnsafeDefault', assigned_vars[var],
+                    f'Mutable default value assigned to {var}'))
 
         return bugs
 

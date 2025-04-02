@@ -6,19 +6,23 @@ from ..knowledge_graph.builder import KnowledgeGraphBuilder
 from ..neural_nets.models import PolicyNetwork, ValueNetwork
 
 class MCTSBugSearch:
-    """Enhanced MCTS with neural guidance and parallel simulations."""
+    """Enhanced MCTS with neural guidance, parallel simulations and learning capabilities."""
     
     def __init__(self, knowledge_graph: nx.DiGraph,
                  policy_net: PolicyNetwork,
                  value_net: ValueNetwork,
+                 bug_buster_model: 'BugBusterModel' = None,
                  max_workers: int = 4):
         self.graph = knowledge_graph
         self.policy_net = policy_net
         self.value_net = value_net
+        self.bug_buster_model = bug_buster_model
         self.tree = {}  # Search tree with state caching
         self.simulation_count = 0
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.state_cache = {}
+        self.error_log = []
+        self.experience_log = []
         
     def search(self, max_iterations: int = 1000,
                parallel_sims: int = 4) -> List[Dict]:
@@ -56,14 +60,20 @@ class MCTSBugSearch:
         if not self.tree[state]['children']:
             return state
             
-        log_n = np.log(self.tree[state]['visits'])
+        log_n = np.log(self.tree[state]['visits'] + 1e-6)  # Avoid log(0)
         best_child = None
         best_score = -np.inf
         
         for child in self.tree[state]['children']:
-            exploit = self.tree[child]['value'] / self.tree[child]['visits']
-            explore = np.sqrt(2 * log_n / self.tree[child]['visits'])
-            score = exploit + explore
+            # Enhanced selection with heuristic factors
+            exploit = self.tree[child]['value'] / (self.tree[child]['visits'] + 1)
+            explore = np.sqrt(2 * log_n / (self.tree[child]['visits'] + 1))
+            
+            # Additional heuristic - prefer nodes with higher complexity
+            complexity = len(list(self.graph.successors(child))) if child in self.graph else 1
+            heuristic = np.log(complexity + 1) * 0.1
+            
+            score = exploit + explore + heuristic
             
             if score > best_score:
                 best_score = score
@@ -81,9 +91,14 @@ class MCTSBugSearch:
         }
         self.tree[state]['children'].append(new_state)
         return new_state
-        
     def _simulate(self, state: str) -> float:
-        """Simulate with neural network evaluation."""
+        """Simulate with neural network evaluation and learning.
+        
+        Uses enhanced reward calculation with:
+        - Bug probability and severity
+        - Code complexity factor
+        - Usage frequency factor
+        """
         self.simulation_count += 1
         
         if state in self.state_cache:
@@ -97,16 +112,54 @@ class MCTSBugSearch:
             bug_prob = self.policy_net(state_vec)
             severity = self.value_net(state_vec)
         
-        # Reward based on bug probability and severity
-        reward = -(bug_prob * severity[2])  # Negative reward weighted by critical severity
+        # Enhanced reward calculation with multiple factors
+        severity_score = severity[2]  # Critical severity
+        complexity = len(list(self.graph.successors(state))) if state in self.graph else 1
+        frequency = self.graph.nodes[state].get('usage_count', 1) if state in self.graph else 1
+        
+        # Reward formula combining multiple heuristics
+        reward = -(
+            bug_prob * severity_score * 0.7 +  # Bug severity impact
+            (1 - 1/complexity) * 0.2 +        # Code complexity factor
+            (1 - 1/frequency) * 0.1           # Usage frequency factor
+        )
+        
+        # Record for learning if model is available
+        if self.bug_buster_model:
+            self.experience_log.append({
+                'state': state_vec,
+                'action': 0,  # Placeholder for actual action
+                'reward': reward
+            })
+            
         return float(reward)
         
     def _backpropagate(self, state: str, reward: float):
-        """Backpropagate simulation results."""
+        """Backpropagate simulation results with learning integration.
+        
+        Updates:
+        - Node visit counts
+        - Node values
+        - Learning model if available
+        """
+        original_state = state
+        total_reward = reward
+        
         while state in self.tree:
             self.tree[state]['visits'] += 1
             self.tree[state]['value'] += reward
+            
+            # Apply learning decay for deeper nodes
+            reward *= 0.9
             state = self._get_parent_state(state)
+        
+        # Record full episode for learning
+        if self.bug_buster_model and original_state in self.state_cache:
+            self.bug_buster_model.record_experience(
+                [self.state_cache[original_state]],
+                [0],  # Placeholder action
+                [total_reward]
+            )
             
     def _state_to_vector(self, state: str) -> torch.Tensor:
         """Convert state to feature vector for neural networks."""
@@ -172,7 +225,7 @@ class MCTSBugSearch:
                         bug_prob = self.policy_net(state_vec)
                         severity = self.value_net(state_vec)
                     
-                    bugs.append({
+                    bug_info = {
                         'location': state,
                         'type': state_data.get('type'),
                         'probability': float(bug_prob),
@@ -182,6 +235,23 @@ class MCTSBugSearch:
                             'critical': float(severity[2])
                         },
                         'visits': self.tree[state]['visits']
-                    })
+                    }
+                    bugs.append(bug_info)
+                    
+                    # Record for error learning if model is available
+                    if self.bug_buster_model and 'actual' in state_data:
+                        self.bug_buster_model.record_error(
+                            state_vec,
+                            {'bug': bug_prob, 'severity': severity.argmax()},
+                            state_data['actual']
+                        )
+        
+        # Perform learning if model is available
+        if self.bug_buster_model and self.experience_log:
+            states = [e['state'] for e in self.experience_log]
+            actions = [e['action'] for e in self.experience_log]
+            rewards = [e['reward'] for e in self.experience_log]
+            self.bug_buster_model.record_experience(states, actions, rewards)
+            self.bug_buster_model.self_improve()
         
         return sorted(bugs, key=lambda x: x['probability'] * x['severity']['critical'], reverse=True)
